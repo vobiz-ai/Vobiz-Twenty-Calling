@@ -67,6 +67,8 @@ Callers are matched on the person's primary phone and every additional phone, on
    | `RECORDING_LINK_TTL_SECONDS` | no | Default `900` |
    | `VOBIZ_WEBHOOK_SIGNATURES` | no | `require` (default), `verify` or `off`. Keep `require` in production |
    | `VOBIZ_MEDIA_HOSTS` | no | Default `*.vobiz.ai`. Hosts that may receive the Vobiz Auth ID and Token when recording audio is fetched. Any other host (for example a presigned storage URL) is fetched without credentials |
+   | `VOBIZ_SIP_AUTH` | no | `jwt` (default): agents register with a short-lived Vobiz access token. `endpoint`: one SIP endpoint per agent with a rotated password. See "How agents register" |
+   | `JWT_TTL_SECONDS` | no | Default `3600` (300 to 86000). Access token lifetime; the softphone renews it about 90 seconds before expiry |
 
    Generate each secret with:
 
@@ -88,7 +90,7 @@ There is nothing to create in Twenty beforehand. The first time anyone connects,
 
 1. Open `<PUBLIC_BASE_URL>/phone` in its own tab and pin it. Closing the tab stops calls ringing.
 2. Click **Connect Twenty** and approve. Calls are logged under your name.
-3. Sign in to Vobiz with your Auth ID and Auth Token from the Vobiz Console. The backend checks them with Vobiz, finds or creates its calling application in your account, and gives you your own SIP endpoint. The token stays in server memory and is never sent back to the browser. (There is no "SIP direct" sign-in; see Limitations.)
+3. Sign in to Vobiz with your Auth ID and Auth Token from the Vobiz Console (a main account `MA_…` or a sub-account `SA_…`). The backend checks them with Vobiz, finds or creates its calling application in your account, and issues your softphone a short-lived access token (see "How agents register"). The Auth Token stays in server memory and is never sent back to the browser. (There is no "SIP direct" sign-in; see Limitations.)
 4. Pick a caller ID. To receive calls on a number, click **Enable inbound calls**. The softphone names the application the number is on now and asks before moving it.
 5. Optional: click **Use this softphone for phone links** and allow it in the browser. After that, clicking a phone number in Twenty brings it to the softphone. Twenty and the softphone must be open in the same browser profile.
 
@@ -125,6 +127,17 @@ A Twenty workspace administrator (anyone with the Workspace permission) can chan
 | Calls are not logged | The softphone says "Reconnect Twenty": click Connect Twenty again. Failed writes are retried for 24 hours. |
 | Recording link says expired | Use **Play** in the softphone's Recent calls for a fresh link. |
 
+## How agents register
+
+By default (`VOBIZ_SIP_AUTH=jwt`) the softphone uses Vobiz access-token login, the same scheme as the Vobiz WebRTC SDK demo:
+
+1. At sign-in the backend asks Vobiz for a token with the account's credentials: `POST /Account/{auth_id}/JWT/Token/` with `iss` = the account, `sub` = the agent's own key, `app` = this integration's application, and permission for incoming and outgoing calls.
+2. The softphone registers as `<sub>_<auth_id>` at `registrar.vobiz.ai`, sending the token in an `X-Vobiz-Jwt` header on REGISTER and on every outbound INVITE. There is no SIP endpoint and no SIP password.
+3. The token's `app` claim sends the agent's outbound calls to this backend's `/vobiz/answer`, so nothing depends on binding an endpoint to the application.
+4. About 90 seconds before the token expires (default lifetime 1 hour), the softphone gets a new one from `POST /api/token`, behind its session, and re-registers.
+
+A token cannot be revoked: signing out stops renewal, and the last token stops working at its expiry. If Vobiz will not mint a token for an account, that sign-in falls back to one SIP endpoint per agent and the softphone says so. Set `VOBIZ_SIP_AUTH=endpoint` to always use endpoints.
+
 ## Limitations
 
 - No "SIP direct" sign-in (an existing endpoint's SIP username and password, without account credentials), unlike some other Vobiz CRM integrations. Without the account's Auth Token the backend cannot verify Vobiz's signed callbacks for those calls, and cannot prove the agent owns the endpoint, so anyone could claim an endpoint and have its calls logged in their workspace. Agents sign in with their Vobiz account.
@@ -140,15 +153,33 @@ A Twenty workspace administrator (anyone with the Workspace permission) can chan
 - Twenty documents a limit of 100 API requests a minute. A logged call costs 2 to 6 requests. A 429 is waited out and retried once; after that the write is queued and retried.
 - Calls are logged as notes. There is no dedicated "Call" object in Twenty, so calls cannot be filtered or reported on as their own records.
 
+## Verified on live calls
+
+On 29 October 2026, with a Vobiz sub-account, access-token sign-in and a Twenty Cloud workspace (`api.twenty.com`):
+
+| Call | Direction | Call UUID |
+| --- | --- | --- |
+| Browser to a mobile, answered, 11 s | Outbound | `476cb4df-68a3-4d9d-ac9e-34f9f88c89c9` |
+| Mobile to a Vobiz number, answered in the browser, 10 s | Inbound | `1411a5c3-fb94-44b7-a439-974f6a70e55e` |
+
+These calls showed that:
+
+- Vobiz mints an access token for a sub-account, and the registrar accepts REGISTER and INVITE as `<sub>_<auth_id>`. Inbound calls ring that identity.
+- The token's `app` claim routes outbound calls to `/vobiz/answer`, with no endpoint binding.
+- Callbacks for a sub-account arrive signed with the sub-account's token, with the main account as `ParentAuthID`.
+- "Enable inbound calls" moves the number onto the application (HTTP 204).
+- The dial result, hangup and recording callbacks arrive, and each call is logged once, as a note on Twenty Cloud.
+
 ## Not yet proven on a live call
 
 These are built and tested against a mock, and need one live call each before they are called verified:
 
-- Outbound and inbound audio, answer, hang-up, mute, hold, DTMF and transfer with a real Vobiz account and the browser softphone.
-- Whether `{"app_id":"<id>"}` binds the endpoint (the backend verifies and falls back), whether `ParentAuthID` on inbound calls matches the number's owner (it is only cross-checked), and in which form `X-VH-*` headers reach `/vobiz/answer` (both are accepted).
-- Whether Vobiz ever resends a callback with the same nonce. A resend would now be refused as a replay.
-- Talk time from `DialAnswer` / `DialHangup`, the recording callback, and recording playback through the Vobiz Recording API.
-- Twenty Cloud. The OAuth discovery document at `https://api.twenty.com` was checked and matches the self-hosted one, but no Cloud workspace was connected.
+- Mute, hold, DTMF and transfer. Also missed, busy and declined outcomes, and the "Call back" task on a real missed call.
+- Access-token renewal against the real registrar (set `JWT_TTL_SECONDS=300` to see it within minutes).
+- Recording playback through the signed link and the Vobiz Recording API. Recordings were reported for both live calls, but playback was not checked. If it returns 502, the audio host needs adding to `VOBIZ_MEDIA_HOSTS`.
+- The talk time and recording link written into the live notes. Check them on the person's timeline.
+- With `VOBIZ_SIP_AUTH=endpoint`: whether `{"app_id":"<id>"}` binds the endpoint (the backend verifies and falls back).
+- In which form `X-VH-*` headers reach `/vobiz/answer` (both forms are accepted), and whether Vobiz ever resends a callback with the same nonce. A resend would be refused as a replay.
 
 Verified against a real self-hosted Twenty: OAuth connect through the softphone, caller lookup (primary and additional phones, company), and the call logger writing notes, note targets, new people, call-back tasks and the recording link update, all shown on the person's timeline and attributed to the connected user.
 
@@ -168,6 +199,7 @@ To try it against a local Twenty, start Twenty with its Docker Compose file, set
 ## Security
 
 - No route returns a SIP password, or lists accounts or endpoints, without a session token.
+- The softphone holds only a short-lived Vobiz access token (or, with `VOBIZ_SIP_AUTH=endpoint`, its own endpoint's rotated password), returned only to that agent's session.
 - Vobiz Auth Tokens and Twenty access tokens live in memory only. Twenty refresh tokens are stored encrypted (AES-256-GCM) in `DATA_DIR`, mode 0600.
 - The backend only talks to Twenty servers in `TWENTY_ALLOWED_URLS`, and sends tokens only to that server's own origin, whatever its discovery document says.
 - The OAuth flow uses PKCE, a state bound to the browser by an HttpOnly cookie, and checks the `iss` Twenty sends back.

@@ -275,12 +275,29 @@ test('a wrong Vobiz token is refused with 401 and creates nothing', async () => 
   assert.match(calls[0].url, /\/numbers\?page=1/);
 });
 
-test('sign-in provisions one app and one endpoint per agent, with the 17-digit app id intact', async () => {
+test('sign-in provisions one app and an access token per agent, with the 17-digit app id intact', async () => {
+  const mark = fetched().length;
   asha.v = await vobizLogin(asha.token, ONE);
   ben.v = await vobizLogin(ben.token, ONE);
   assert.equal(asha.v.appId, ONE.appId);
-  assert.notEqual(asha.v.sipUser, ben.v.sipUser, 'two agents never share an endpoint');
-  assert.match(asha.v.sipUser, /^tw[0-9a-f]{14}x[0-9a-f]{6}1187694299$/, 'username read back after Vobiz rewrote it');
+  assert.equal(asha.v.sipAuth, 'jwt');
+  assert.notEqual(asha.v.sipUser, ben.v.sipUser, 'two agents never share an identity');
+  assert.match(asha.v.sipUser, /^tw[0-9a-f]{14}_MA_TEST0001$/, 'registers as <sub>_<authId>');
+  // The softphone gets a token, never a SIP password.
+  assert.equal(asha.v.agent.sipPassword, undefined);
+  assert.equal(asha.v.agent.sipAuth, 'jwt');
+  assert.equal(asha.v.agent.accessToken.split('.').length, 3);
+  assert.ok(asha.v.agent.tokenExpiresAt > Date.now() + 50 * 60 * 1000);
+  const mints = fetched().slice(mark).filter(f => f.url.endsWith('/Account/MA_TEST0001/JWT/Token/'));
+  assert.equal(mints.length, 2);
+  const claims = JSON.parse(mints[0].body);
+  assert.equal(claims.iss, ONE.authId);
+  assert.match(claims.sub, /^tw[0-9a-f]{14}$/);
+  assert.equal(claims.app, ONE.appId, 'the app claim is a string, never a rounded number');
+  assert.match(mints[0].body, /"app":"43919358318796814"/);
+  assert.deepEqual(claims.per, { voice: { incoming_allow: true, outgoing_allow: true } });
+  assert.ok(claims.nbf <= Math.floor(Date.now() / 1000) - 30, 'nbf set back for clock skew');
+  assert.equal(fetched().slice(mark).filter(f => f.authId === ONE.authId && /\/Endpoint\//.test(f.url)).length, 0, 'no SIP endpoint is created or bound');
   assert.deepEqual(asha.v.numbers, ['+910000000001', '+910000000002'], 'inactive and voice-disabled numbers are not offered');
   const created = fetched().filter(f => f.url.endsWith('/Application/') && f.method === 'POST');
   assert.equal(created.length, 1, 'one application for the account');
@@ -291,8 +308,13 @@ test('sign-in provisions one app and one endpoint per agent, with the 17-digit a
   assert.equal(app.fallback_answer_url, `${PUBLIC}/vobiz/fallback`);
 });
 
-test('account two binds through the {"application": <integer>} retry', async () => {
+test('an account that cannot mint tokens falls back to an endpoint, bound through the {"application": <integer>} retry', async () => {
   cara.v = await vobizLogin(cara.token, TWO);
+  assert.equal(cara.v.sipAuth, 'endpoint');
+  assert.match(cara.v.jwtError, /HTTP 404/);
+  assert.match(cara.v.sipUser, /^tw[0-9a-f]{14}x[0-9a-f]{6}1187694299$/, 'username read back after Vobiz rewrote it');
+  assert.ok(cara.v.agent.sipPassword, 'an endpoint sign-in gets its rotated password');
+  assert.equal(cara.v.agent.accessToken, undefined);
   assert.equal(cara.v.bound, true);
   const bodies = fetched().filter(f => f.authId === TWO.authId && f.method === 'POST' && /\/Endpoint\/\d+\/$/.test(f.url)).map(f => f.body);
   assert.ok(bodies.includes(`{"application":${TWO.appId}}`), 'integer literal, never a rounded JS number');
@@ -308,8 +330,19 @@ test('signing in again ends the older session of the same agent', async () => {
   stream.close();
   const old = await req('/api/session', bearer(asha.token));
   assert.equal(old.status, 401);
-  assert.equal(second.v.sipUser, asha.v.sipUser, 'same agent, same endpoint');
+  assert.equal(second.v.sipUser, asha.v.sipUser, 'same agent, same identity');
   asha = second;
+});
+
+test('access token renewal: behind the session, at most one mint a minute, never for an endpoint sign-in', async () => {
+  assert.equal((await req('/api/token', post({}))).status, 401);
+  const mark = fetched().length;
+  const again = await json(await req('/api/token', post({}, asha.token)));
+  assert.equal(again.accessToken, asha.v.agent.accessToken, 'just minted: the current token comes back');
+  assert.equal(fetched().slice(mark).filter(f => f.url.includes('/JWT/Token/')).length, 0, 'no second mint within a minute');
+  const endpointSession = await req('/api/token', post({}, cara.token));
+  assert.equal(endpointSession.status, 400);
+  assert.equal((await json(endpointSession)).code, 'not_jwt');
 });
 
 test('caller ID: only the account\'s own numbers', async () => {
@@ -689,6 +722,8 @@ test('sub-accounts: callbacks carry the main account as ParentAuthID and are acc
   const SUB = { authId: 'SA_TEST0003', authToken: 'tok-sub-three', parent: 'MA_TEST0009' };
   const agent = await connect(201, TW_B);
   agent.v = await vobizLogin(agent.token, SUB);
+  assert.equal(agent.v.sipAuth, 'jwt', 'a sub-account mints its own tokens (iss is the sub-account)');
+  assert.match(agent.v.sipUser, /^tw[0-9a-f]{14}_SA_TEST0003$/);
   const from = `sip:${agent.v.sipUser}@registrar.vobiz.ai`;
   // Outbound from the sub-account's endpoint: the live failure that showed this.
   const out = await vobizPost('/vobiz/answer', { CallUUID: 'call-sub-out', From: from, To: '+919000000011', ParentAuthID: SUB.parent }, SUB.authToken);

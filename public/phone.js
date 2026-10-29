@@ -26,6 +26,8 @@
   try { token = sessionStorage.getItem(TOKEN_KEY); } catch (e) { token = null; }
   var session = null;      // what /api/session returned
   var ua = null;
+  var sipToken = null;     // Vobiz access token (JWT) when signed in with one
+  var renewTimer = null;
   var registered = false;
   var rtc = null;          // current JsSIP RTCSession
   var call = null;         // { direction, number, ref, callUuid, startedAt, answeredAt, lookup }
@@ -115,7 +117,8 @@
     show('signin-forms', !signedIn);
     show('btn-signout', signedIn);
     if (!signedIn) text('login-status', connected ? 'Not signed in.' : 'Connect Twenty first.');
-    else text('login-status', 'Logged in as ' + session.authId + ' — calling from ' + (session.from || 'no number'));
+    else text('login-status', 'Logged in as ' + session.authId + ' — calling from ' + (session.from || 'no number')
+      + (session.sipAuth === 'jwt' ? ' · access token' : session.sipAuth === 'endpoint' ? ' · SIP endpoint' : ''));
 
     // Steps 3, 4 and inbound.
     lock('step-caller', !signedIn);
@@ -195,7 +198,7 @@
       if (!s) { setStatus('off', 'Offline'); return; }
       startStream();
       loadHistory();
-      if (s.mode === 'account') return api('/agent').then(function (a) { startUA(a.sipUser, a.sipPassword, a.registrarUrl, a.displayName); });
+      if (s.mode === 'account') return api('/agent').then(function (a) { startUA(a); });
       setStatus('off', 'Offline');
     }).catch(function (err) {
       if (err.status !== 401) notice(err.message, 'error');
@@ -231,11 +234,12 @@
       .then(function (s) {
         session = s;
         if (s.bound === false) notice('Signed in, but your endpoint could not be linked to the calling application. Outbound calls may fail.', 'warn');
+        else if (s.jwtError) notice('Vobiz did not issue an access token (' + s.jwtError + '), so you are signed in with a SIP endpoint instead.', 'warn');
         else notice('');
         render();
         return api('/agent');
       })
-      .then(function (a) { startUA(a.sipUser, a.sipPassword, a.registrarUrl, a.displayName); })
+      .then(function (a) { startUA(a); })
       .catch(function (err) { setStatus('error', 'Not signed in'); notice(err.message, 'error'); });
   };
 
@@ -312,21 +316,34 @@
 
   // ─── SIP ───────────────────────────────────────────────────────────────────
 
-  function startUA(sipUser, sipPassword, registrarUrl, displayName) {
+  /**
+   * Register with Vobiz as the identity /api/agent returned. With an access
+   * token (sipAuth "jwt") there is no SIP password: the token goes in an
+   * X-Vobiz-Jwt header on REGISTER and on every outbound INVITE, and is
+   * renewed shortly before it expires. With an endpoint, the password as usual.
+   */
+  function startUA(a) {
     stopUA();
     if (typeof JsSIP === 'undefined') { setStatus('error', 'SIP missing'); notice('The SIP library did not load. Reload the page.', 'error'); return; }
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { setStatus('error', 'No microphone'); notice('This page needs microphone access over HTTPS.', 'error'); return; }
     setStatus('pending', 'Connecting');
+    var jwt = a.sipAuth === 'jwt';
+    var cfg = {
+      sockets: [new JsSIP.WebSocketInterface(a.registrarUrl)],
+      uri: a.sipUser.indexOf('sip:') === 0 ? a.sipUser : 'sip:' + a.sipUser,
+      display_name: a.displayName,
+      register: true,
+      user_agent: 'VobizXCalling/1.0.0',
+      session_timers: false,
+    };
+    if (!jwt) cfg.password = a.sipPassword;
     try {
-      ua = new JsSIP.UA({
-        sockets: [new JsSIP.WebSocketInterface(registrarUrl)],
-        uri: sipUser.indexOf('sip:') === 0 ? sipUser : 'sip:' + sipUser,
-        password: sipPassword,
-        display_name: displayName,
-        register: true,
-        user_agent: 'VobizXCalling/1.0.0',
-        session_timers: false,
-      });
+      ua = new JsSIP.UA(cfg);
+      if (jwt) {
+        sipToken = a.accessToken;
+        ua.registrator().setExtraHeaders(['X-Vobiz-Jwt: ' + sipToken]);
+        scheduleRenew(a.tokenExpiresAt);
+      }
     } catch (err) {
       setStatus('error', 'SIP error');
       notice('Could not start the phone: ' + err.message, 'error');
@@ -343,7 +360,36 @@
       .catch(function () { notice('Allow the microphone for this site, or callers will not hear you.', 'error'); });
   }
 
+  // ─── access token renewal ──────────────────────────────────────────────────
+
+  var RENEW_BEFORE_MS = 90 * 1000;
+
+  function scheduleRenew(expiresAt) {
+    if (renewTimer) clearTimeout(renewTimer);
+    var wait = Math.max(10 * 1000, Number(expiresAt) - Date.now() - RENEW_BEFORE_MS);
+    renewTimer = setTimeout(renewToken, wait);
+  }
+
+  /** A new token from the backend, then re-register with it right away. */
+  function renewToken() {
+    renewTimer = null;
+    if (!ua || !sipToken) return;
+    api('/token', { body: {} }).then(function (r) {
+      if (!ua) return;
+      sipToken = r.accessToken;
+      ua.registrator().setExtraHeaders(['X-Vobiz-Jwt: ' + sipToken]);
+      ua.register();
+      scheduleRenew(r.tokenExpiresAt);
+    }).catch(function (err) {
+      if (err.status === 401) return; // signed out; api() already said so
+      notice('Could not renew your calling token: ' + err.message + '. Retrying.', 'warn');
+      renewTimer = setTimeout(renewToken, 30 * 1000);
+    });
+  }
+
   function stopUA() {
+    if (renewTimer) { clearTimeout(renewTimer); renewTimer = null; }
+    sipToken = null;
     registered = false;
     if (rtc) { try { rtc.terminate(); } catch (e) { /* ignore */ } }
     if (ua) { var old = ua; ua = null; try { old.removeAllListeners(); old.stop(); } catch (e) { /* ignore */ } }
@@ -376,6 +422,8 @@
     ref = ref || newRef();
     var headers = ['X-VH-Ref: ' + ref];
     if (/^\+?\d{10,15}$/.test(session.from || '')) headers.push('X-VH-Caller-ID: ' + session.from);
+    // Token sign-in: the registrar checks the token on the INVITE as well.
+    if (sipToken) headers.push('X-Vobiz-Jwt: ' + sipToken);
     call = { direction: 'outbound', number: number, ref: ref, startedAt: Date.now() };
     $('in-dial').value = number;
     showCall('Calling ' + number);

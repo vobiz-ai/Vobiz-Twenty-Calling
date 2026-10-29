@@ -208,6 +208,37 @@ async function bindEndpoint(account, endpointId, appId) {
   return bound;
 }
 
+// Vobiz checks sub against ^[A-Za-z0-9_-]*$ (at most 50). An underscore would
+// also blur "<sub>_<authId>", which the SIP side splits on, so none here.
+const JWT_SUB_RE = /^[A-Za-z0-9-]{1,40}$/;
+
+/**
+ * A short-lived access token (JWT) for one agent, minted by Vobiz with the
+ * account's credentials (POST /Account/{id}/JWT/Token/, as Vobiz-RTC-demo
+ * does). The browser registers as "<sub>_<authId>" and sends the token in an
+ * X-Vobiz-Jwt header; it never holds a SIP password. The app claim names the
+ * application whose answer URL handles this agent's outbound calls, so no
+ * endpoint binding is involved. nbf is set a minute back to absorb clock skew
+ * (Vobiz rejects a token that is "not yet valid").
+ */
+async function mintAccessToken(account, { sub, appId, ttlSeconds }) {
+  if (!JWT_SUB_RE.test(String(sub || ''))) return { error: 'invalid sub' };
+  const nbf = Math.floor(Date.now() / 1000) - 60;
+  const exp = nbf + 60 + Number(ttlSeconds);
+  const body = JSON.stringify({
+    iss: account.authId, sub: String(sub), nbf, exp,
+    per: { voice: { incoming_allow: true, outgoing_allow: true } },
+    ...(ID_RE.test(String(appId || '')) ? { app: String(appId) } : {}),
+  });
+  const r = await vobiz(account, 'POST', '/JWT/Token/', body);
+  const token = r.body && typeof r.body.token === 'string' ? r.body.token : '';
+  if (!ok(r) || token.split('.').length !== 3) {
+    const why = (r.body && (r.body.error || r.body.message)) || '';
+    return { error: `HTTP ${r.status}${why ? `: ${String(why).slice(0, 160)}` : ''}` };
+  }
+  return { token, sipUser: `${sub}_${account.authId}`, expiresAt: exp * 1000 };
+}
+
 /** Attach a number to the application. Moves it off whatever it was on. */
 async function attachNumber(account, e164, appId) {
   const enc = `%2B${String(e164).replace(/\D/g, '')}`;
@@ -271,5 +302,5 @@ async function fetchRecordingAudio(account, src) {
 module.exports = {
   fetchRecordingAudio, mediaHostTrusted,
   vobiz, ok, listOf, parseVobizJson, fetchAccountNumbers, ensureApplication, ensureEndpoint,
-  bindEndpoint, boundAppId, attachNumber, transferLeg, recordingSource, answerUrl, APP_NAME,
+  bindEndpoint, boundAppId, attachNumber, mintAccessToken, transferLeg, recordingSource, answerUrl, APP_NAME,
 };

@@ -22,7 +22,7 @@ The backend is the Help Scout integration's design (`Vobiz-Helpscout-Calling`) w
 ## Sign-in
 
 1. **Connect Twenty.** `/twenty/oauth/start?server=<origin>` accepts only origins in `TWENTY_ALLOWED_URLS`. It reads the server's `/.well-known/oauth-authorization-server`, refuses a token or registration endpoint on any other origin, and registers a public OAuth client once per server (`POST /oauth/register`, no secret). It sets a short-lived HttpOnly cookie, creates a PKCE S256 pair, and redirects to the `authorization_endpoint` from discovery (Twenty Cloud serves it on `app.twenty.com` with `?iss=`). The callback checks the cookie against `state` and the `iss` parameter against the issuer, exchanges the code with the verifier, and reads the user with `POST /metadata { currentUser { ... currentWorkspace { workspaceUrls } workspaceMember currentUserWorkspace { permissionFlags } } }`. It stores the refresh token encrypted and redirects to `/phone#link=<one-time code>`, which the page trades for a session token.
-2. **Sign in to Vobiz.** The agent's key is a hash of the workspace and user, so each Twenty user gets one SIP endpoint per Vobiz account. The backend verifies the Auth ID and token with `GET /numbers`, finds or creates its application (matched on `answer_url`), finds or creates the endpoint, reads the rewritten username back, rotates its password, and binds it with `{"app_id":"<id>"}` then verifies, falling back to `{"application": <integer>}`.
+2. **Sign in to Vobiz.** The agent's key is a hash of the workspace and user (alphanumeric). The backend verifies the Auth ID and token with `GET /numbers` and finds or creates its application (matched on `answer_url`). Then, with `VOBIZ_SIP_AUTH=jwt` (default), it mints an access token, `POST /Account/{auth_id}/JWT/Token/` with `{iss, sub: <agent key>, nbf, exp, per: {voice: {incoming_allow, outgoing_allow}}, app: "<app id>"}`. The agent registers as `<agent key>_<auth_id>` with the token in `X-Vobiz-Jwt`, and renews it through `POST /api/token` before `exp`. If the mint fails, or with `VOBIZ_SIP_AUTH=endpoint`, it finds or creates one endpoint per agent, reads the rewritten username back, rotates its password, and binds it with `{"app_id":"<id>"}` then verifies, falling back to `{"application": <integer>}`.
 
 There is no SIP-direct sign-in: without an account's Auth Token, callbacks about those calls could not be verified and endpoint ownership could not be proven.
 
@@ -30,7 +30,7 @@ A workspace is keyed by `(Twenty origin, workspace id)`. A user is an administra
 
 ## Calls
 
-**Outbound.** The browser calls `sip:<number>@registrar.vobiz.ai` with `X-VH-Caller-ID` and `X-VH-Ref` headers. `/vobiz/answer` maps the SIP user to the agent, checks the caller ID belongs to that account, and returns `<Record>` then `<Dial callerId><Number>`.
+**Outbound.** The browser calls `sip:<number>@registrar.vobiz.ai` with `X-VH-Caller-ID` and `X-VH-Ref` headers (and `X-Vobiz-Jwt` with a token sign-in). `/vobiz/answer` maps the SIP user to the agent, checks the caller ID belongs to that account, and returns `<Record>` then `<Dial callerId><Number>`.
 
 **Which account a callback is about.** Every Vobiz callback is tied to one account from server state only: the call record for its `CallUUID`, else the agent's SIP user in `From`, else the signed-in account that owns the dialled `To` number. It is verified with that account's token alone, a `ParentAuthID` naming another account is refused, and each signature nonce is accepted once per URL. Fields the sender chose never pick the account, so one Vobiz customer cannot sign callbacks that write into another's CRM.
 
@@ -60,7 +60,8 @@ One note per call, written as the agent who handled it when they are connected, 
 | Data | Where | Lifetime |
 | --- | --- | --- |
 | Vobiz Auth Token | Memory, keyed by Auth ID | Until restart |
-| SIP password | Memory, in the agent's session | Rotated each sign-in |
+| Vobiz access token (JWT) | Memory, in the agent's session; the agent's browser | `JWT_TTL_SECONDS` (1 hour), renewed by the softphone |
+| SIP password (endpoint sign-in only) | Memory, in the agent's session | Rotated each sign-in |
 | Twenty access token | Memory | 30 minutes, refreshed on demand |
 | Twenty refresh token | `DATA_DIR/store.json`, AES-256-GCM | 60 days, replaced on every refresh |
 | Twenty OAuth client id | `DATA_DIR/store.json` | Until the redirect URL changes |

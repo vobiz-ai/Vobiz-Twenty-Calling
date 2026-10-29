@@ -286,6 +286,25 @@ global.fetch = async (url, opts = {}) => {
     if (appIdLit && acct.honoursAppId) e.app = appIdLit[1];
     return new Response('', { status: 202 });
   }
+  // Access tokens, with the checks backend-apis makes (GenerateTokenHandler /
+  // ValidateTokenClaims): iss must be the account in the URL, sub matches
+  // ^[A-Za-z0-9_-]*$ (<= 50), exp - nbf between 3 minutes and 24 hours, per
+  // booleans, app (if given) an application on the account. Account TWO plays
+  // an account without access-token calling, so sign-in falls back.
+  if (p === '/JWT/Token/' && method === 'POST') {
+    if (authId === 'MA_TEST0002') return json({ error: 'not found' }, 404);
+    const b = JSON.parse(opts.body);
+    const bad = msg => json({ api_id: 'x', error: `Failed to generate JWT token. ${msg}` }, 400);
+    if (b.iss !== authId) return bad('Provided iss not associated to Authorized account');
+    if (typeof b.sub !== 'string' || !/^[A-Za-z0-9_-]*$/.test(b.sub) || b.sub.length > 50) return bad('Invalid sub');
+    if (!Number.isInteger(b.nbf) || !Number.isInteger(b.exp) || b.exp - b.nbf < 180 || b.exp - b.nbf > 86400) return bad('Invalid expiry duration');
+    const v = b.per && b.per.voice;
+    if (!v || typeof v.incoming_allow !== 'boolean' || typeof v.outgoing_allow !== 'boolean') return bad('Invalid permission present in payload');
+    if (b.app !== undefined && !apps[authId].some(a => String(a.app_id) === String(b.app))) return bad(`Invalid app id ${b.app}`);
+    const enc = o => Buffer.from(JSON.stringify(o)).toString('base64url');
+    const input = `${enc({ alg: 'HS256', typ: 'JWT', cty: 'auris;v=1' })}.${enc({ sub: b.sub, iss: authId, nbf: b.nbf, exp: b.exp, per: b.per, app: b.app })}`;
+    return json({ token: `${input}.${crypto.createHmac('sha256', acct.token).update(input).digest('base64url')}` });
+  }
   if (/^\/Call\/[^/]+\/$/.test(p) && method === 'POST') return json({ message: 'call transferred' }, 202);
   if (p.startsWith('/Recording/?call_uuid=')) {
     return json({ objects: [{ recording_id: 'other', call_uuid: 'someone-else', recording_url: 'https://media.vobiz.test/other.mp3' }, ...recordings[authId]] });

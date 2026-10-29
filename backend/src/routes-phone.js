@@ -86,6 +86,7 @@ function publicSession(s) {
     appId: (account && account.appId) || null,
     from: s.from || null,
     sipUser: s.sipUser || null,
+    sipAuth: s.sipAuth || null,
     settings: {
       autoOpen: !!(ws.settings && ws.settings.autoOpen),
       defaultCountry: (ws.settings && ws.settings.defaultCountry) || config.DEFAULT_COUNTRY,
@@ -206,13 +207,12 @@ api.post('/login', requireIdentity, async (req, res) => {
   const s = req.sess;
   const appId = await v.ensureApplication(account);
   if (!appId) return res.status(502).json({ error: 'Could not find or create the calling application in your Vobiz account.' });
-  const ep = await v.ensureEndpoint(account, s.agentKey);
-  if (!ep) return res.status(502).json({ error: 'Could not set up your SIP endpoint in your Vobiz account.' });
-  const bound = await v.bindEndpoint(account, ep.endpointId, appId);
-  if (!bound) log(`! ${account.authId}: endpoint ${ep.endpointId} is not bound to ${appId}; outbound calls may not reach /vobiz/answer`);
+  const sip = await sipIdentity(account, s.agentKey, appId);
+  if (sip.error) return res.status(502).json({ error: sip.error });
 
-  // The password just rotated, so any other session of this agent holds a dead
-  // one. End it: that tab shows "signed in elsewhere" instead of looking ready.
+  // The registrar keeps one registration per identity, and with an endpoint
+  // the password just rotated, so any other session of this agent is dead.
+  // End it: that tab shows "signed in elsewhere" instead of looking ready.
   for (const [t, o] of liveSessions()) {
     if (t !== req.token && o.agentKey === s.agentKey && o.mode) endSession(t, 'elsewhere');
   }
@@ -222,11 +222,41 @@ api.post('/login', requireIdentity, async (req, res) => {
 
   const numbers = list.callerIds;
   const from = numbers.includes(s.lastCallerId) ? s.lastCallerId : (numbers[0] || '');
-  Object.assign(s, { mode: 'account', authId: account.authId, numbers, from, sipUser: ep.username, sipPassword: ep.password, endpointId: ep.endpointId });
-  state.sipUsers.set(ep.username, { authId: account.authId, agentKey: s.agentKey, wsKey: s.wsKey, userId: s.userId, name: s.name, callerId: from });
-  log(`login ok: ${account.authId} / ${s.agentKey} as ${ep.username}, ${numbers.length} caller ID(s)`);
-  res.json({ ...publicSession(s), bound });
+  if (s.sipUser && s.sipUser !== sip.sipUser) state.sipUsers.delete(s.sipUser);
+  Object.assign(s, {
+    mode: 'account', authId: account.authId, numbers, from, appId,
+    sipAuth: sip.sipAuth, sipUser: sip.sipUser, sipPassword: sip.sipPassword, endpointId: sip.endpointId,
+    accessToken: sip.accessToken, tokenExpiresAt: sip.tokenExpiresAt, tokenMintedAt: sip.accessToken ? Date.now() : null,
+  });
+  state.sipUsers.set(sip.sipUser, { authId: account.authId, agentKey: s.agentKey, wsKey: s.wsKey, userId: s.userId, name: s.name, callerId: from });
+  log(`login ok: ${account.authId} / ${s.agentKey} as ${sip.sipUser} (${sip.sipAuth}), ${numbers.length} caller ID(s)`);
+  res.json({ ...publicSession(s), bound: sip.bound, ...(sip.jwtError ? { jwtError: sip.jwtError } : {}) });
 });
+
+/**
+ * The SIP identity an agent registers as. With VOBIZ_SIP_AUTH=jwt (default),
+ * a short-lived access token: no endpoint and no SIP password exist, and the
+ * token's app claim routes outbound calls to this integration's application.
+ * If Vobiz will not mint one (the account cannot, or the API is down), and
+ * with VOBIZ_SIP_AUTH=endpoint, one SIP endpoint per agent with a rotated
+ * password, bound to the application.
+ */
+async function sipIdentity(account, agentKey, appId) {
+  let jwtError = null;
+  if (config.VOBIZ_SIP_AUTH === 'jwt') {
+    const t = await v.mintAccessToken(account, { sub: agentKey, appId, ttlSeconds: config.JWT_TTL_SECONDS });
+    if (t.token) {
+      return { sipAuth: 'jwt', sipUser: t.sipUser, sipPassword: null, endpointId: null, accessToken: t.token, tokenExpiresAt: t.expiresAt, bound: true };
+    }
+    jwtError = t.error;
+    log(`! ${account.authId}: Vobiz did not mint an access token (${t.error}); falling back to a SIP endpoint`);
+  }
+  const ep = await v.ensureEndpoint(account, agentKey);
+  if (!ep) return { error: 'Could not set up your SIP endpoint in your Vobiz account.' };
+  const bound = await v.bindEndpoint(account, ep.endpointId, appId);
+  if (!bound) log(`! ${account.authId}: endpoint ${ep.endpointId} is not bound to ${appId}; outbound calls may not reach /vobiz/answer`);
+  return { sipAuth: 'endpoint', sipUser: ep.username, sipPassword: ep.password, endpointId: ep.endpointId, accessToken: null, tokenExpiresAt: null, bound, jwtError };
+}
 
 // There is no "SIP direct" sign-in (an existing endpoint's username and
 // password, no account credentials). With no Auth Token the backend cannot
@@ -246,7 +276,35 @@ api.post('/logout', requireIdentity, (req, res) => {
 api.get('/agent', requireVobiz, (req, res) => {
   const s = req.sess;
   res.set('Cache-Control', 'no-store');
-  res.json({ sipUser: `${s.sipUser}@${config.VOBIZ_REGISTRAR}`, sipPassword: s.sipPassword, registrarUrl: `wss://${config.VOBIZ_REGISTRAR}:5063/`, displayName: s.name });
+  res.json({
+    sipUser: `${s.sipUser}@${config.VOBIZ_REGISTRAR}`, registrarUrl: `wss://${config.VOBIZ_REGISTRAR}:5063/`, displayName: s.name,
+    sipAuth: s.sipAuth,
+    // One of the two, never both: a token for jwt, a password for endpoint.
+    ...(s.sipAuth === 'jwt' ? { accessToken: s.accessToken, tokenExpiresAt: s.tokenExpiresAt } : { sipPassword: s.sipPassword }),
+  });
+});
+
+/**
+ * A fresh access token for this agent, which the softphone asks for shortly
+ * before the current one expires. Behind the session like /agent. Within a
+ * minute of the last mint the current token is returned instead, so a tab
+ * cannot turn this into a token faucet against the Vobiz API.
+ */
+api.post('/token', requireVobiz, async (req, res) => {
+  const s = req.sess;
+  res.set('Cache-Control', 'no-store');
+  if (s.sipAuth !== 'jwt') return res.status(400).json({ error: 'This sign-in uses a SIP endpoint, not an access token.', code: 'not_jwt' });
+  const account = state.accounts.get(s.authId);
+  if (s.accessToken && s.tokenMintedAt && Date.now() - s.tokenMintedAt < 60 * 1000) {
+    return res.json({ accessToken: s.accessToken, tokenExpiresAt: s.tokenExpiresAt });
+  }
+  const t = await v.mintAccessToken(account, { sub: s.agentKey, appId: s.appId, ttlSeconds: config.JWT_TTL_SECONDS });
+  if (!t.token) {
+    log(`x ${s.authId}: access token renewal for ${s.agentKey} failed (${t.error})`);
+    return res.status(502).json({ error: 'Vobiz did not issue a new access token. Sign in again.' });
+  }
+  Object.assign(s, { accessToken: t.token, tokenExpiresAt: t.expiresAt, tokenMintedAt: Date.now() });
+  res.json({ accessToken: t.token, tokenExpiresAt: t.expiresAt });
 });
 
 api.get('/numbers', requireVobiz, (req, res) => res.json(publicSession(req.sess)));

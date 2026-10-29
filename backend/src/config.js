@@ -64,6 +64,15 @@ const config = {
   // fetched. A leading "*." matches subdomains. Any other host (a presigned
   // storage URL, say) is fetched without credentials.
   VOBIZ_MEDIA_HOSTS: String(env.VOBIZ_MEDIA_HOSTS || '*.vobiz.ai').split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
+  // How the softphone registers with Vobiz:
+  //   jwt (default)  a short-lived access token per agent, minted by this
+  //                  backend; no SIP endpoint and no SIP password exist;
+  //   endpoint       one SIP endpoint per agent with a rotated password.
+  // With jwt, a sign-in whose token cannot be minted falls back to endpoint.
+  VOBIZ_SIP_AUTH: (env.VOBIZ_SIP_AUTH || 'jwt').toLowerCase() === 'endpoint' ? 'endpoint' : 'jwt',
+  // Access token lifetime. Vobiz accepts 3 minutes to 24 hours; the softphone
+  // renews it about 90 seconds before it expires.
+  JWT_TTL_SECONDS: Math.min(86000, Math.max(300, Number(env.JWT_TTL_SECONDS || 3600))),
   // require (default) | verify | off. See vobiz-signature.js.
   VOBIZ_WEBHOOK_SIGNATURES: (env.VOBIZ_WEBHOOK_SIGNATURES || 'require').toLowerCase(),
 
